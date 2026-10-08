@@ -455,6 +455,9 @@ function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
 
+  if (player.playing && !analyzer && player.analyser) {
+    analyzer = createAudioAnalyzer(player.analyser, config);
+  }
   if (player.playing && analyzer) {
     const music = analyzer.update(now);
     const mapped = mapper.update(music, config, grid, now / 1000, dt);

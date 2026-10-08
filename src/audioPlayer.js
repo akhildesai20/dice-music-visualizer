@@ -16,7 +16,11 @@ export function createAudioPlayer() {
   let analyser = null;
   let inputMix = null;
   let elementSource = null;
+  let audibleGain = null;
   let midiGain = null;
+  let midiFilter = null;
+  let midiComp = null;
+  let midiMakeup = null;
   let micGain = null;
   let micNode = null;
   let micStream = null;
@@ -55,31 +59,56 @@ export function createAudioPlayer() {
     ctx = new AC();
     output = ctx.createGain();
     output.gain.value = volume;
+    audibleGain = ctx.createGain();
+    audibleGain.gain.value = 1;
     analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     analyser.smoothingTimeConstant = 0.25;
     inputMix = ctx.createGain();
     midiGain = ctx.createGain();
-    midiGain.gain.value = 0.9;
+    midiGain.gain.value = 0.45;
+    midiFilter = ctx.createBiquadFilter();
+    midiFilter.type = 'lowpass';
+    midiFilter.frequency.value = 3800;
+    midiFilter.Q.value = 0.7;
+    midiComp = ctx.createDynamicsCompressor();
+    midiComp.threshold.value = -20;
+    midiComp.knee.value = 16;
+    midiComp.ratio.value = 5;
+    midiComp.attack.value = 0.008;
+    midiComp.release.value = 0.22;
+    midiMakeup = ctx.createGain();
+    midiMakeup.gain.value = 2.6;
     micGain = ctx.createGain();
-    micGain.gain.value = volume;
+    micGain.gain.value = volume * 3;
     elementSource = ctx.createMediaElementSource(audio);
     elementSource.connect(inputMix);
-    midiGain.connect(inputMix);
+    midiGain.connect(midiFilter);
+    midiFilter.connect(midiComp);
+    midiComp.connect(midiMakeup);
+    midiMakeup.connect(inputMix);
     inputMix.connect(analyser);
-    analyser.connect(output);
+    analyser.connect(audibleGain);
+    audibleGain.connect(output);
     output.connect(ctx.destination);
+    // A silent branch keeps the analyser running while the mic is muted.
+    const keepAlive = ctx.createGain();
+    keepAlive.gain.value = 0;
+    analyser.connect(keepAlive);
+    keepAlive.connect(ctx.destination);
   }
 
   function setAudible(on) {
-    if (!analyser || !output || audible === on) return;
+    if (!audibleGain || audible === on) return;
     audible = on;
-    try { analyser.disconnect(output); } catch { /* already detached */ }
-    if (on) analyser.connect(output);
+    audibleGain.gain.value = on ? 1 : 0;
   }
 
-  function stopMic() {
-    micToken += 1;
+  function applyMicLevel() {
+    if (micGain) micGain.gain.value = volume * 3;
+  }
+
+  function releaseMicHardware() {
     micLive = false;
     if (micStream) {
       for (const track of micStream.getTracks()) track.stop();
@@ -92,6 +121,11 @@ export function createAudioPlayer() {
     if (micGain && analyser) {
       try { micGain.disconnect(analyser); } catch { /* already detached */ }
     }
+  }
+
+  function stopMic() {
+    micToken += 1;
+    releaseMicHardware();
   }
 
   function silenceVoices() {
@@ -136,7 +170,15 @@ export function createAudioPlayer() {
   }
 
   function scheduleNote(note, when) {
-    const vel = Math.max(0.05, Math.min(1, note.vel / 127));
+    if (voices.length >= 28) {
+      const oldest = voices.shift();
+      try {
+        oldest.gain.gain.cancelScheduledValues(when);
+        oldest.gain.gain.setTargetAtTime(0.0001, when, 0.012);
+        oldest.source.stop(when + 0.04);
+      } catch { /* already stopped */ }
+    }
+    const vel = Math.max(0.08, Math.min(1, note.vel / 127));
     const gain = ctx.createGain();
     gain.connect(midiGain);
     const drum = note.channel === 9;
@@ -144,26 +186,30 @@ export function createAudioPlayer() {
     if (drum) {
       source = ctx.createBufferSource();
       source.buffer = noise();
-      source.playbackRate.value = 0.45 + note.note / 90;
+      source.playbackRate.value = 0.35 + note.note / 80;
       const filter = ctx.createBiquadFilter();
-      filter.type = note.note < 46 ? 'lowpass' : 'highpass';
-      filter.frequency.value = note.note < 46 ? 220 : 1800;
+      filter.type = 'lowpass';
+      filter.frequency.value = 180 + note.note * 36;
+      filter.Q.value = 0.5;
       source.connect(filter);
       filter.connect(gain);
     } else {
       source = ctx.createOscillator();
-      source.type = note.note < 48 ? 'square' : note.note > 76 ? 'sine' : 'triangle';
+      source.type = 'triangle';
       source.frequency.value = 440 * (2 ** ((note.note - 69) / 12));
       source.connect(gain);
     }
-    const dur = Math.max(0.04, Math.min(note.dur, drum ? 0.22 : 4));
-    const peak = (drum ? 0.28 : note.note < 48 ? 0.11 : 0.075) * vel;
+    const dur = Math.max(0.06, Math.min(note.dur, drum ? 0.16 : 8));
+    const peak = (drum ? 0.34 : 0.28) * vel;
+    const attack = drum ? 0.005 : 0.02;
+    const release = drum ? 0.045 : Math.min(0.14, Math.max(0.04, dur * 0.3));
+    const hold = when + Math.max(attack + 0.012, dur - release);
     gain.gain.setValueAtTime(0.0001, when);
-    gain.gain.exponentialRampToValueAtTime(peak, when + 0.012);
-    gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak * 0.4), when + Math.min(0.14, dur * 0.45));
-    gain.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+    gain.gain.exponentialRampToValueAtTime(peak, when + attack);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak * (drum ? 0.25 : 0.7)), hold);
+    gain.gain.exponentialRampToValueAtTime(0.0001, hold + release);
     source.start(when);
-    source.stop(when + dur + 0.02);
+    source.stop(hold + release + 0.02);
     const voice = { source, gain };
     voices.push(voice);
     source.onended = () => {
@@ -251,23 +297,33 @@ export function createAudioPlayer() {
     });
   }
 
+  function requestMic() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error('This browser has no microphone input.'));
+    }
+    const audioConstraints = { echoCancellation: false, noiseSuppression: false, autoGainControl: true };
+    return navigator.mediaDevices.getUserMedia({ audio: audioConstraints }).catch((err) => {
+      if (err && (err.name === 'OverconstrainedError' || err.name === 'NotSupportedError')) {
+        return navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+      throw err;
+    });
+  }
+
   async function startMic() {
     ensureGraph();
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('This browser has no microphone input.');
-    }
+    const token = ++micToken;
+    const pending = requestMic();
     if (ctx.state === 'suspended') await ctx.resume();
     audio.pause();
     pauseMidi(true);
-    stopMic();
-    const token = ++micToken;
+    releaseMicHardware();
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false }
-      });
-    } catch {
-      throw new Error('Microphone permission was blocked.');
+      stream = await pending;
+    } catch (err) {
+      const missing = err && (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError');
+      throw new Error(missing ? 'No microphone was found.' : 'Microphone permission was blocked.');
     }
     if (token !== micToken || sourceMode !== 'mic') {
       for (const track of stream.getTracks()) track.stop();
@@ -275,7 +331,7 @@ export function createAudioPlayer() {
     }
     micStream = stream;
     micNode = ctx.createMediaStreamSource(micStream);
-    micGain.gain.value = volume;
+    applyMicLevel();
     micNode.connect(micGain);
     try { micGain.disconnect(analyser); } catch { /* first connection */ }
     micGain.connect(analyser);
@@ -285,8 +341,8 @@ export function createAudioPlayer() {
 
   async function play() {
     ensureGraph();
-    if (ctx.state === 'suspended') await ctx.resume();
     if (sourceMode === 'mic') return startMic();
+    if (ctx.state === 'suspended') await ctx.resume();
     if (!loaded) return;
     setAudible(true);
     stopMic();
@@ -332,7 +388,7 @@ export function createAudioPlayer() {
   function setVolume(v) {
     volume = Math.max(0, Math.min(1, v));
     if (output) output.gain.value = volume;
-    if (micGain) micGain.gain.value = volume;
+    applyMicLevel();
   }
 
   function setSource(mode) {
